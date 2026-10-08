@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""
+bserve -- serve a directory over BHTTP/1 (see SPEC.md).
+
+    ./bserve ./www 9000
+
+Accepts TCP connections, reads binary request frames, maps :path to a file
+under the root, and answers with a HEADERS frame and DATA frames. Connections
+stay open until the client closes them or goes idle.
+
+The frame codec is deliberately not shared with bcurl. The only thing the
+two programs have in common is SPEC.md.
+"""
+
+import email.utils
+import mimetypes
+import os
+import socket
+import struct
+import sys
+import threading
+from urllib.parse import unquote
+
+
+PREFACE = b"BHTP\x01\x00\x00\x00"
+FRAME = struct.Struct(">HBBI")
+FRAME_HEADER_LEN = FRAME.size 
+MAX_PAYLOAD = 0xFFFF
+
+T_HEADERS, T_DATA, T_GOAWAY = 0x01, 0x02, 0x03
+F_END_STREAM = 0x01
+
+E_NO_ERROR, E_PROTOCOL_ERROR, E_BAD_PREFACE, E_IDLE_TIMEOUT = 0, 1, 2, 3
+
+STATIC_TABLE = [
+    None,
+    ":method",
+    ":path",
+    ":status",
+    ":authority",
+    "content-type",
+    "content-length",
+    "user-agent",
+    "server",
+    "date",
+    "last-modified",
+]
+STATIC_INDEX = {name: i for i, name in enumerate(STATIC_TABLE) if name}
+
+DATA_CHUNK = 16 * 1024
+IDLE_TIMEOUT = 30.0
+SERVER_NAME = "bserve/1.0"
+
+
+class Malformed(Exception):
+    """The HEADERS payload is bad, but the frame boundaries are fine, so the
+    connection survives. We answer 400 on that request ID."""
+
+
+class ConnectionBroken(Exception):
+    """The byte stream itself can no longer be trusted. Send GOAWAY and close."""
+
+    def __init__(self, code, reason):
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+
+
+def pack_frame(ftype, flags, rid, payload=b""):
+    if len(payload) > MAX_PAYLOAD:
+        raise ValueError("payload too large for one frame")
+    return FRAME.pack(len(payload), ftype, flags, rid) + payload
+
+
+def read_exact(rfile, n):
+    """Read n bytes. A buffered read blocks until it has n bytes or hits EOF,
+    so a short result means the peer closed."""
+    return rfile.read(n) or b""
+
+
+def read_frame(rfile):
+    """Return (type, flags, request_id, payload), or None on EOF at a frame boundary."""
+    head = read_exact(rfile, FRAME_HEADER_LEN)
+    if not head:
+        return None
+    if len(head) < FRAME_HEADER_LEN:
+        raise ConnectionBroken(E_PROTOCOL_ERROR, "connection closed mid frame header")
+    length, ftype, flags, rid = FRAME.unpack(head)
+    payload = read_exact(rfile, length)
+    if len(payload) < length:
+        raise ConnectionBroken(E_PROTOCOL_ERROR, "connection closed mid frame payload")
+    return ftype, flags, rid, payload
+
+
+def encode_fields(fields):
+    out = bytearray()
+    for name, value in fields:
+        v = value if isinstance(value, bytes) else str(value).encode("utf-8")
+        if len(v) > 0xFFFF:
+            raise ValueError(f"value of {name} too long")
+        idx = STATIC_INDEX.get(name)
+        if idx:
+            out.append(idx)
+        else:
+            n = name.encode("ascii")
+            out += bytes([0x00, len(n)]) + n
+        out += struct.pack(">H", len(v)) + v
+    return bytes(out)
+
+
+def decode_fields(p):
+    fields = []
+    i = 0
+    while i < len(p):
+        b = p[i]
+        i += 1
+        if b == 0x00:
+            if i >= len(p):
+                raise Malformed("truncated literal name length")
+            n = p[i]
+            i += 1
+            if n == 0 or i + n > len(p):
+                raise Malformed("bad literal name length")
+            try:
+                name = p[i:i + n].decode("ascii")
+            except UnicodeDecodeError:
+                raise Malformed("literal name is not ASCII")
+            i += n
+            if name.startswith(":") or name != name.lower():
+                raise Malformed(f"illegal literal name {name!r}")
+        elif b < len(STATIC_TABLE):
+            name = STATIC_TABLE[b]
+        else:
+            raise Malformed(f"unknown name index 0x{b:02x}")
+        if i + 2 > len(p):
+            raise Malformed("truncated value length")
+        (vlen,) = struct.unpack_from(">H", p, i)
+        i += 2
+        if i + vlen > len(p):
+            raise Malformed("value runs past end of frame")
+        fields.append((name, p[i:i + vlen]))
+        i += vlen
+    return fields
+
+
+def parse_request(payload):
+    fields = decode_fields(payload)
+    pseudo = {}
+    for name, value in fields:
+        if name.startswith(":"):
+            if name not in (":method", ":path", ":authority"):
+                raise Malformed(f"{name} is not a request pseudo-field")
+            if name in pseudo:
+                raise Malformed(f"duplicate {name}")
+            try:
+                pseudo[name] = value.decode("ascii")
+            except UnicodeDecodeError:
+                raise Malformed(f"{name} is not ASCII")
+    for required in (":method", ":path"):
+        if required not in pseudo:
+            raise Malformed(f"missing {required}")
+    if not pseudo[":path"].startswith("/"):
+        raise Malformed(":path must start with /")
+    return pseudo[":method"], pseudo[":path"]
+
+
+def resolve(root, url_path):
+    """Return a file path under root, or None. Nothing outside root is ever returned."""
+    path = unquote(url_path.split("?", 1)[0].split("#", 1)[0])
+    if "\x00" in path:
+        return None
+    candidate = os.path.realpath(os.path.join(root, path.lstrip("/")))
+    if candidate != root and not candidate.startswith(root + os.sep):
+        return None
+    if os.path.isdir(candidate):
+        candidate = os.path.join(candidate, "index.html")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def send_simple(sock, rid, status, text, head_only=False):
+    body = (text + "\n").encode("utf-8")
+    fields = [
+        (":status", str(status)),
+        ("content-type", "text/plain; charset=utf-8"),
+        ("content-length", str(len(body))),
+        ("server", SERVER_NAME),
+        ("date", email.utils.formatdate(usegmt=True)),
+    ]
+    if head_only:
+        sock.sendall(pack_frame(T_HEADERS, F_END_STREAM, rid, encode_fields(fields)))
+    else:
+        sock.sendall(pack_frame(T_HEADERS, 0, rid, encode_fields(fields))
+                     + pack_frame(T_DATA, F_END_STREAM, rid, body))
+
+
+def respond(sock, rid, method, path, root, peer):
+    if method not in ("GET", "HEAD"):
+        log(peer, f"#{rid} {method} {path} -> 405")
+        return send_simple(sock, rid, 405, f"method {method} not allowed")
+
+    fpath = resolve(root, path)
+    if fpath is None:
+        log(peer, f"#{rid} {method} {path} -> 404")
+        return send_simple(sock, rid, 404, f"not found: {path}", method == "HEAD")
+
+    try:
+        f = open(fpath, "rb")
+    except OSError:
+        log(peer, f"#{rid} {method} {path} -> 404 (unreadable)")
+        return send_simple(sock, rid, 404, f"not found: {path}", method == "HEAD")
+
+    with f:
+        st = os.fstat(f.fileno())
+        ctype = mimetypes.guess_type(fpath)[0] or "application/octet-stream"
+        if ctype.startswith("text/"):
+            ctype += "; charset=utf-8"
+        fields = [
+            (":status", "200"),
+            ("content-type", ctype),
+            ("content-length", str(st.st_size)),
+            ("server", SERVER_NAME),
+            ("date", email.utils.formatdate(usegmt=True)),
+            ("last-modified", email.utils.formatdate(st.st_mtime, usegmt=True)),
+        ]
+        no_body = method == "HEAD" or st.st_size == 0
+        sock.sendall(pack_frame(T_HEADERS, F_END_STREAM if no_body else 0, rid,
+                                encode_fields(fields)))
+        sent = 0
+        if not no_body:
+            chunk = f.read(DATA_CHUNK)
+            while chunk:
+                nxt = f.read(DATA_CHUNK)
+                sock.sendall(pack_frame(T_DATA, 0 if nxt else F_END_STREAM, rid, chunk))
+                sent += len(chunk)
+                chunk = nxt
+            if sent == 0:
+                sock.sendall(pack_frame(T_DATA, F_END_STREAM, rid))
+    log(peer, f"#{rid} {method} {path} -> 200 ({st.st_size} bytes)")
+
+
+def log(peer, msg):
+    print(f"[{peer[0]}:{peer[1]}] {msg}", flush=True)
+
+
+def goaway(sock, last_rid, code, reason):
+    payload = struct.pack(">IH", last_rid, code) + reason.encode("utf-8")[:1024]
+    try:
+        sock.sendall(pack_frame(T_GOAWAY, 0, 0, payload))
+    except OSError:
+        pass
+
+
+def serve_connection(sock, peer, root):
+    sock.settimeout(IDLE_TIMEOUT)
+    rfile = sock.makefile("rb")
+    open_requests = {}
+    last_rid = 0
+    frames = 0
+    try:
+        if read_exact(rfile, len(PREFACE)) != PREFACE:
+            raise ConnectionBroken(E_BAD_PREFACE, "expected BHTP version 1 preface")
+        sock.sendall(PREFACE)
+
+        while True:
+            frame = read_frame(rfile)
+            if frame is None:
+                break
+            frames += 1
+            ftype, flags, rid, payload = frame
+
+            if ftype == T_HEADERS:
+                if rid == 0:
+                    raise ConnectionBroken(E_PROTOCOL_ERROR, "HEADERS on request id 0")
+                if rid in open_requests:
+                    raise ConnectionBroken(E_PROTOCOL_ERROR, f"second HEADERS for request {rid}")
+                try:
+                    method, path = parse_request(payload)
+                except Malformed as e:
+                    log(peer, f"#{rid} malformed HEADERS ({e}) -> 400")
+                    send_simple(sock, rid, 400, f"malformed request: {e}")
+                    last_rid = max(last_rid, rid)
+                    continue
+                if flags & F_END_STREAM:
+                    respond(sock, rid, method, path, root, peer)
+                    last_rid = max(last_rid, rid)
+                else:
+                    open_requests[rid] = (method, path)
+
+            elif ftype == T_DATA:
+                if rid in open_requests and flags & F_END_STREAM:
+                    method, path = open_requests.pop(rid)
+                    respond(sock, rid, method, path, root, peer)
+                    last_rid = max(last_rid, rid)
+
+            elif ftype == T_GOAWAY:
+                log(peer, "client sent GOAWAY")
+                break
+
+            else:
+                log(peer, f"skipped unknown frame type 0x{ftype:02x} ({len(payload)} bytes)")
+
+    except socket.timeout:
+        goaway(sock, last_rid, E_IDLE_TIMEOUT, "idle timeout")
+        log(peer, "idle timeout")
+    except ConnectionBroken as e:
+        goaway(sock, last_rid, e.code, e.reason)
+        log(peer, f"GOAWAY: {e.reason}")
+    except OSError as e:
+        log(peer, f"socket error: {e}")
+    finally:
+        log(peer, f"closed after {frames} frame(s)")
+        try:
+            rfile.close()
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit("usage: bserve ROOT PORT [HOST]")
+    root = os.path.realpath(sys.argv[1])
+    port = int(sys.argv[2])
+    host = sys.argv[3] if len(sys.argv) > 3 else "0.0.0.0"
+    if not os.path.isdir(root):
+        sys.exit(f"bserve: {root} is not a directory")
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((host, port))
+    srv.listen(128)
+    print(f"bserve: serving {root} on {host}:{port}", flush=True)
+    try:
+        while True:
+            conn, peer = srv.accept()
+            log(peer, "connected")
+            threading.Thread(target=serve_connection, args=(conn, peer, root),
+                             daemon=True).start()
+    except KeyboardInterrupt:
+        print("\nbserve: shutting down")
+    finally:
+        srv.close()
+
+
+if __name__ == "__main__":
+    main()
